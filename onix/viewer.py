@@ -1,15 +1,319 @@
-from onix.objects import OnixObject
+from pathlib import Path
+import SimpleITK as sitk
 
 
-class OnixViewer(OnixObject):
+class MapOverlay():
     """ """
 
+    _alpha = 255
+    _range = [0, 1000]
+    _cmax = 1000
+    _cmid = 500
+
+    _array: np.ndarray
+    _image: itk.Image
+    _slicer: np.ndarray
+
+    scaling_list = [
+        "None",
+        "Log",
+    ]
+    scaling: str = "None"
+
+    operation_list: list[str] = [
+        "None",
+        "Divide",
+        "Difference",
+        "SSIM",
+    ]
+    operation: str = "None"
+
+    def __init__(
+        self,
+    ):
+        self._volume_1 = None
+        self._volume_2 = None
+        self._mask = None
+        self._mask_lower = None
+        self._mask_upper = None
+        self._array = None
+        self._image = None
+        self._mask_array = None
+        self._mask_image = None
+        self._fixed_range = None
+
+    def update_colormap(self, color_range, alpha, fixed_range):
+        """ """
+        if fixed_range is None:
+            self._fixed_range = None
+        else:
+            self._fixed_range = fixed_range
+        self._range = color_range
+        self._alpha = alpha
+
+    def get_colormap(self):
+        """ """
+        if self.difference:
+            cs = px.colors.get_colorscale("RdBu")
+        else:
+            #cs = px.colors.get_colorscale("Jet")
+            cs = px.colors.get_colorscale("Turbo")
+        cs = px.colors.sample_colorscale(cs, np.arange(0, 254) / 254)
+        cs = [
+            list(map(int, x.replace("rgb(", "").replace(")", "").split(", ")))
+            + [
+                self._alpha,
+            ]
+            for x in cs
+        ]
+        return cs
+
+    def get_hist(self):
+        """ """
+        if self._slicer is None:
+            return None, None, None
+        else:
+            hist = self._array[np.where(self._mask_array == 1)]
+            return hist, self._xlo, self._xhi
+
+    def get_value(self, x, y, z):
+        """ """
+        if self._array is None:
+            return np.nan
+        else:
+            return self._array[z, y, x]
+
+    def get_volume_1(self, x, y, z):
+        """ """
+        if self.volume_1 is None:
+            return np.nan
+        else:
+            return self.volume_1.array[z, y, x]
+
+    def get_volume_2(self, x, y, z):
+        """ """
+        if self.volume_2 is None:
+            return np.nan
+        else:
+            return self.volume_2.array[z, y, x]
+
+    def update_mask(self, mask: OnixMask | None):
+        """ """
+        self._mask = mask
+
+    def update_volume_1(self, volume: OnixVolume | None):
+        """ """
+        self.volume_1 = volume
+
+    def update_volume_2(self, volume: OnixVolume | None):
+        """ """
+        self.volume_2 = volume
+
+    def update(self):
+        """ """
+        if self.volume_1 == None:
+            self._slicer = None
+            return
+
+        # Load Volume 1
+        array1 = self.volume_1.array
+        image1 = self.volume_1.image
+
+        # Load Volume 2
+        if self.volume_2 is not None:
+            array2 = self.volume_2.array
+            image2 = self.volume_2.image
+
+            if self.operation == "SSIM":
+                _, array = structural_similarity(
+                    self.volume_1.array,
+                    self.volume_2.array,
+                    data_range=1,
+                    full=True,
+                )
+                _, S = structural_similarity(
+                    sitk.GetArrayFromImage(self.volume_1.image),
+                    sitk.GetArrayFromImage(self.volume_2.image),
+                    win_size=21,
+                    data_range=1,
+                    full=True,
+                )
+                image = orient_array(S, self.volume_1.image)
+
+            elif self.operation == "Difference":
+                array = array1 - array2
+                image = sitk.SubtractImageFilter().Execute(image1, image2)
+
+            elif self.operation == "Divide":
+                array = array1 / array2
+                image = sitk.DivideImageFilter().Execute(image1, image2)
+
+            else:
+                array = array1
+                image = image1
+        
+        self._array = array
+        self._image = image
+
+        # Load mask
+        if self._mask is None:
+            self._mask_array = np.ones_like(self._array)
+            self._mask_image = sitk.Image(self._image)
+        else:
+            self._mask_array = self._mask.array
+            self._mask_image = self._mask.image
+
+        # Update mask based on thresholds
+        self._mask_array = np.where(
+            np.all(
+                self._mask.array >= self._mask_lower, 
+                self._mask.array <= self._mask_upper,
+            ),
+            1, 0,
+        )
+        self._mask_image = binary_threshold(
+            self._mask.image, 
+            self._mask_lower, 
+            self._mask_upper,
+        )
+
+        # Rescale map based on thresholds into range between [1, 255]
+        # This way 0 will be reserved for values outside the binary mask
+        self.rescale_map()
+
+        # Convert map to uint8
+        self._image = cast_uint8(self._image)
+
+        # Apply binary mask to the map
+        self._image = mask_uint8_map(self._image, self._mask_image)
+
+        # Convert sitk to ndarray for VolumeSlicer
+        self._slicer = slicer_array(self._image)
+
+    def rescale_map(self):
+        """ """
+        cmid = self._cmid
+        cmax = self._cmax
+        lo, hi = self._range
+
+        array = self._array
+        image = self._image
+        mask_array = self._mask_array
+        mask_image = self._mask_image
+        
+        assert mask_array.shape == array.shape:
+
+        hist = array[np.where(mask_array == 1)]
+        xmin = np.min(hist)
+        xmax = np.max(hist)
+
+        R = sitk.RescaleIntensityImageFilter()
+
+        if self.operation == "Difference":
+            xrm = max(-xmin, xmax)
+            xhi = xrm * abs(hi - cmid) / cmid
+            xlo = xrm * abs(cmid - lo) / cmid
+            xr = min(xhi, xlo)
+            array = np.where(array < xr, array, xr)
+            array = np.where(array > -xr, array, -xr)
+            image = threshold_above(image, xr)
+            image = threshold_below(image, -xr)
+            _min = np.min(array)
+            _max = np.max(array)
+            R.SetOutputMinimum(128 + 127 * (_min / xr))
+            R.SetOutputMaximum(128 + 127 * (_max / xr))
+            self._xlo = -xr
+            self._xhi = xr
+        else:
+            if self._fixed_range is not None:
+                xmin = self._fixed_range[0]
+                xmax = self._fixed_range[1]
+            xrange = xmax - xmin
+            xhi = xmin + xrange * (hi / cmax)
+            xlo = xmin + xrange * (lo / cmax)
+            xr = xhi - xlo
+            array = np.where(array < xhi, array, xhi)
+            array = np.where(array > xlo, array, xlo)
+            image = threshold_above(image, xhi)
+            image = threshold_below(image, xlo)
+            _min = np.min(array)
+            _max = np.max(array)
+            R.SetOutputMinimum(1 + 254 * ((_min - xlo) / xr))
+            R.SetOutputMaximum(1 + 254 * ((_max - xlo) / xr))
+            self._xlo = xlo
+            self._xhi = xhi
+
+        self._array = array
+        self._image = R.Execute(image)
+
+
+class MaskOverlay():
+    """ """
+    _alpha = 255
+    _range = [0, 255]
+    _cmax = 255
+    _cmid = 127
+
+    _array: np.ndarray
+    _image: itk.Image
+    _slicer: np.ndarray
+
+    operation_list: list[str] = [
+        "None",
+        "Divide",
+        "Difference",
+        "SSIM",
+    ]
+    operation: str = "None"
+    _alpha = 255
+    _range = [0, 1000]
+    _cmax = 1000
+    _cmid = 500
+
+    _array: np.ndarray
+    _image: itk.Image
+    _slicer: np.ndarray
+
+    scaling_list = [
+        "None",
+        "Log",
+    ]
+    scaling: str = "None"
+
+    operation_list: list[str] = [
+        "None",
+        "Divide",
+        "Difference",
+        "SSIM",
+    ]
+    operation: str = "None"
+
+    def __init__(
+        self,
+    ):
+        self._mask_1 = None
+        self._mask_2 = None
+        self._mask = None
+        self._array = None
+        self._image = None
+        self._fixed_range = None
+
+    def update(self):
+        """ """
+        array1 *= 75
+        array2 *= 150
+        image1 = self.multiply_filter(image1, 75)
+        image2 = self.multiply_filter(image2, 150)
+        
+        self._xlo = np.min(self._array)
+        self._xhi = np.max(self._array)
+
+
+class OnixViewer():
+    """ """
     _PLOTLY_LOGO = "https://images.plot.ly/logo/new-branding/plotly-logomark.png"
     _DBC_CSS = "https://cdn.jsdelivr.net/gh/AnnMarieW/dash-bootstrap-templates@V1.0.2/dbc.min.css"
     _EXTERNAL_STYLESHEETS = [dbc.themes.DARKLY, _DBC_CSS]
-
-    subject_id: str
-    study_date: str
 
     app: Dash
 
@@ -17,47 +321,33 @@ class OnixViewer(OnixObject):
     slicer_y: VolumeSlicer
     slicer_x: VolumeSlicer
 
-    fitt_ds: OnixDataset
-    nnfit_ds: OnixDataset
-    ds: dict[str, OnixDataset]
-
-    t1_tx = None
-    ref_tx = None
+    datasets: dict[str, OnixDataset]
+    dataset_pairs: list[tuple[str, str]]
+    t1_tx = dict[tuple[str, str], sitk.Transform]
+    ref_tx = dict[tuple[str, str], sitk.Transform]
 
     metrics: OnixMetrics
-
-    overlay_list: list[str]
     overlay: OnixOverlay
-
-    _cache_list: list[str] = [
-        'fitt_tx',
-        'nnfit_tx',
-        't1_tx',
-        'ref_tx',
-        'map_df',
-        'map_df_t1',
-        'map_table',
-        'map_table_t1',
-        'ratio_df',
-        'ratio_table',
-        'ccb_mask',
-    ]
 
     def __init__(
         self,
         datasets: dict[str, OnixDataset],
+        dataset_pairs: list[tuple[str, str]],
         save_path: str | Path,
         load_path: str | Path | None,
+        log: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO",
     ):
         """
         """
         self.datasets = datasets
+        self.dataset_pairs = dataset_pairs
         self.save_path = Path(save_path) 
         self.load_path = Path(load_path) if load_path is not None else None
+        self.log = log
 
         if self.load_path is not None:
             try: 
-                self._load_cache()
+                self._load(self.load_path)
                 print('Loaded cached data...')
                 return
             except Exception as e:
@@ -71,150 +361,43 @@ class OnixViewer(OnixObject):
             self._maps[name] = ds._maps
             self._masks[name] = ds._masks
 
-        self._register_routine()
+        self._register_datasets()
 
-        if save_outputs:
+        self.metrics = Metrics()
+        self.map_overlay = MapOverlay()
+        self.mask_overlay = MaskOverlay()
 
-            print("REGISTER ROUTINES")
-
-            _, self.t1_tx = _register_routine(
-                self.fitt_ds.t1.image,
-                self.nnfit_ds.t1.image,
-                learn_rate=0.01,
-                stop=0.001,
-                max_steps=50,
-                log=log,
-            )
-
-            with open(onix_path / 't1_tx.pkl', 'wb') as f:
-                pickle.dump(self.t1_tx, f, pickle.HIGHEST_PROTOCOL)
-
-            _, self.ref_tx = _register_routine(
-                self.fitt_ds.ref.image,
-                self.nnfit_ds.ref.image,
-                learn_rate=0.01,
-                stop=0.001,
-                max_steps=50,
-                log=log,
-            )
-
-            with open(onix_path / 'ref_tx.pkl', 'wb') as f:
-                pickle.dump(self.ref_tx, f, pickle.HIGHEST_PROTOCOL)
-
-        else:
-
-            print("LOADING REGISTRATION ROUTINES") 
-
-            with open(onix_path / 't1_tx.pkl', 'rb') as f:
-                self.t1_tx = pickle.load(f)
-            with open(onix_path / 'ref_tx.pkl', 'rb') as f:
-                self.ref_tx = pickle.load(f)
-
-        print("time 2:", _profile_time - time.time())
-        _profile_time = time.time()
-
-        ###self.nnfit_ds.spectra  = self.nnfit_ds.spectra.register(self.fitt_ds.ref, self.nnfit_ds.ref, self.ref_tx)
-        ###self.nnfit_ds.baseline = self.nnfit_ds.baseline.register(self.fitt_ds.ref, self.nnfit_ds.ref, self.ref_tx)
-        ###self.nnfit_ds.fit      = self.nnfit_ds.fit.register(self.fitt_ds.ref, self.nnfit_ds.ref, self.ref_tx)
-
-        print("time 3:", _profile_time - time.time())
-        _profile_time = time.time()
-
-        _metrics_time = time.time()
-        self.metrics = OnixMetrics(
-            self.fitt_ds,
-            self.nnfit_ds,
-            self.t1_tx,
-            self.ref_tx,
-            self.fitt_ds.brain_mask,
-            self.fitt_ds.qmap,
-            save_outputs = save_outputs,
-            overwrite_ccb = overwrite_ccb,
-        )
-        print("metrics time:", _metrics_time - time.time())
-
-        # Initialize cho/naa masks
-        self.update_cho_naa_threshold(2.0, 2.0)
-
-        _overlay_time = time.time()
-        self.overlay = OnixOverlay(
-            ref=self.fitt_ds.ref,
-            brain_mask=self.fitt_ds.brain_mask.align(self.fitt_ds.t1),
-            qmap=self.fitt_ds.qmap.align(self.fitt_ds.t1),
-            hqmap=self.fitt_ds.hqmap.align(self.fitt_ds.t1),
-            vhqmap=self.fitt_ds.vhqmap.align(self.fitt_ds.t1),
-            nnqmap=self.fitt_ds.nnqmap.align(self.fitt_ds.t1),
-            nnhqmap=self.fitt_ds.nnhqmap.align(self.fitt_ds.t1),
-            nnvhqmap=self.fitt_ds.nnvhqmap.align(self.fitt_ds.t1),
-            t2star=self.fitt_ds.t2star.align(self.fitt_ds.t1),
-            ccb_mask=self.metrics.ccb_mask,
-            volume_1=None,
-            volume_2=None,
-        )
-        # From metrics...
-        self.overlay_list += ['fitt cho/naa mask', 'nnfit cho/naa mask']
-        #self.overlay_list += ['fitt cho/naa mask connect', 'nnfit cho/naa mask connect']
-        self.overlay_list += ['fitt cho/naa 2x', 'nnfit cho/naa 2x']
-        self.overlay_list += ['fitt cho/naa 2x connect', 'nnfit cho/naa 2x connect']
-        self.overlay_list += ['fitt cho/naa 2x connect2', 'nnfit cho/naa 2x connect2']
-        print("overlay time:", _overlay_time - time.time())
-
-        print("time 4:", _profile_time - time.time())
-        _profile_time = time.time()
-
-        ###if jupyter:
-        ###    self.app = JupyterDash(
-        ###        __name__,
-        ###        external_stylesheets=self._EXTERNAL_STYLESHEETS,
-        ###        use_pages=True,
-        ###        # suppress_callback_exceptions=True,
-        ###    )
-        ###else:
-        ###    self.app = Dash(
-        ###        __name__,
-        ###        external_stylesheets=self._EXTERNAL_STYLESHEETS,
-        ###        use_pages=True,
-        ###        # suppress_callback_exceptions=True,
-        ###    )
         self.app = Dash(
             __name__,
             external_stylesheets=self._EXTERNAL_STYLESHEETS,
             use_pages=True,
             pages_folder="",
-            # suppress_callback_exceptions=True,
+            #suppress_callback_exceptions=True,
         )
-
-        print("time 5:", _profile_time - time.time())
-        _profile_time = time.time()
 
         self.init_slicer()
         self.init_pages()
         self.init_callbacks()
 
-        print("time 6:", _profile_time - time.time())
-        _profile_time = time.time()
-
-        # SAVE METRICS
-        if save_metrics_path is not None:
-            os.makedirs(save_metrics_path, exist_ok=True)
-            self.metrics.save_metrics(save_metrics_path)
-
-    def _load_cache(self):
-        """
-        Load data from previous Onix session.
-        """
-        # TODO
-        ### files = list(x.name for x in onix_path.iterdir())
-        ### missing = (x for x in self._cache_list if x not in files)
-        ### if any(missing):
-        ###     raise Exception("Cache missing files")
-        pass
-
-    def _register_routine(self):
+    def _register_datasets(self):
         """
         Register the T1 and reference images for each dataset.
         """
-        pass
+        for a, b in self.dataset_pairs:
+            dataset_1 = self.datasets[a]
+            dataset_2 = self.datasets[b]
+
+            _, self.t1_tx = register_routine(
+                dataset_1.t1.image,
+                dataset_2.t1.image,
+                log = self.log == "DEBUG",
+            )
+        
+            _, self.ref_tx = register_routine(
+                self.fitt_ds.ref.image,
+                self.nnfit_ds.ref.image,
+                log = self.log == "DEBUG",
+            )
 
     def update_overlay_volume(self, dataset_name, label, primary=False):
         """ 
@@ -281,14 +464,14 @@ class OnixViewer(OnixObject):
             self.slicer_x.create_overlay_data(_overlay, _colormap),
         )
 
-    def si_to_mri_coords(self, dataset_name: str, x: float, y: float, z: float):
+    def mrsi_to_mri_coords(self, dataset_name: str, x: float, y: float, z: float):
         """ """
         ds = self.datasets[dataset_name]
         return ds.t1.image.TransformPhysicalPointToIndex(
             ds.ref.image.TransformIndexToPhysicalPoint([x, y, z])
         )
 
-    def mri_to_si_coords(self, dataset_name: str, x: float, y: float, z: float):
+    def mri_to_mrsi_coords(self, dataset_name: str, x: float, y: float, z: float):
         """ """
         ds = self.datasets[dataset_name]
         return ds.ref.image.TransformPhysicalPointToIndex(
